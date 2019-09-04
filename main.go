@@ -38,7 +38,6 @@ type Dbrow struct {
 	Open    int    `json:"open"`
 	Desired string `json:"desired_at"`
 	Created string `json:"created_at"`
-	Latest  string `json:"latest"`
 }
 
 //Dbrows hogefuga
@@ -82,7 +81,38 @@ func allList() *[]Dbrow {
 		}
 		sliceDbrow = append(sliceDbrow, row)
 
-		//fmt.Printf("id: %d, pid: %d, name: %s, body: %s\n", row.Id, row.Pid, row.Name, row.Body)
+	}
+
+	return &sliceDbrow
+}
+
+func searchList(str string) *[]Dbrow {
+
+	var sliceDbrow []Dbrow
+
+	db, err := sql.Open("sqlite3", "./data.db")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	q := `
+		SELECT id, parentid, title FROM memo WHERE body LIKE ?
+	`
+	rows, err := db.Query(q, "%"+str+"%")
+
+	defer rows.Close()
+	for rows.Next() {
+		row := Dbrow{}
+
+		// カーソルから値を取得
+		if err := rows.Scan(
+			&row.ID,
+			&row.Pid,
+			&row.Title); err != nil {
+			log.Fatal("rows.Scan() ", err)
+			return &sliceDbrow
+		}
+		sliceDbrow = append(sliceDbrow, row)
 
 	}
 
@@ -283,11 +313,13 @@ func pSelectdb(w http.ResponseWriter, r *http.Request) {
 
 	title := "list"
 	content := `<div style="width: 100%"><table border="1" style="width: 100%">{__tbody__}</table></div>`
+	lastTitle := "list"
 	var tbody []string
 
 	w.Header().Set("Content-Type", "text/html")
 
-	base := `
+	if p != "0" {
+		base := `
 		<tr style="background-color: #bde9ba;">
 		<td colspan="1">番号: {__id__}</td>
 		<td colspan="2">件名: {__title__}</td>
@@ -303,34 +335,79 @@ func pSelectdb(w http.ResponseWriter, r *http.Request) {
 		<td colspan="3">{__body__}</td>
 		</tr>
 		`
-	pid, err := strconv.Atoi(p)
-	if err != nil {
-		fmt.Println("parse error")
-	}
-	var lastTitle string
-	rep := regexp.MustCompile("\n")
-	pDbrow := withChildList(pid)
-	for i, data := range *pDbrow {
-		state := "open"
-		if data.Open == 0 {
-			state = "closed"
+		pid, err := strconv.Atoi(p)
+		if err != nil {
+			fmt.Println("parse error")
 		}
-		fmt.Println("row: ", i)
-		ht := strings.Replace(base, "{__id__}", html.EscapeString(strconv.Itoa(data.ID)), -1)
-		ht = strings.Replace(ht, "{__title__}", html.EscapeString(data.Title), 1)
-		ht = strings.Replace(ht, "{__name__}", html.EscapeString(data.Name), 1)
-		ht = strings.Replace(ht, "{__created__}", html.EscapeString(data.Created), 1)
-		ht = strings.Replace(ht, "{__desired__}", html.EscapeString(data.Desired), 1)
-		ht = strings.Replace(ht, "{__open__}", html.EscapeString(state), 1)
-		ht = strings.Replace(ht, "{__body__}", rep.ReplaceAllString(html.EscapeString(data.Body), "<br>"), 1)
-		tbody = append(tbody, ht)
-		lastTitle = data.Title
+		rep := regexp.MustCompile("\n")
+		pDbrow := withChildList(pid)
+		for i, data := range *pDbrow {
+			state := "open"
+			if data.Open == 0 {
+				state = "closed"
+			}
+			fmt.Println("row: ", i)
+			ht := strings.Replace(base, "{__id__}", html.EscapeString(strconv.Itoa(data.ID)), -1)
+			ht = strings.Replace(ht, "{__title__}", html.EscapeString(data.Title), 1)
+			ht = strings.Replace(ht, "{__name__}", html.EscapeString(data.Name), 1)
+			ht = strings.Replace(ht, "{__created__}", html.EscapeString(data.Created), 1)
+			ht = strings.Replace(ht, "{__desired__}", html.EscapeString(data.Desired), 1)
+			ht = strings.Replace(ht, "{__open__}", html.EscapeString(state), 1)
+			ht = strings.Replace(ht, "{__body__}", rep.ReplaceAllString(html.EscapeString(data.Body), "<br>"), 1)
+			tbody = append(tbody, ht)
+			lastTitle = data.Title
+		}
 	}
 
 	content = strings.Replace(content, "{__tbody__}", strings.Join(tbody, "\n"), 1)
 
 	// output to browser
 	fmt.Fprintf(w, outputHTML(title, content, outputFormWithChild(p, lastTitle)))
+}
+
+func search(w http.ResponseWriter, r *http.Request) {
+
+	w.Header().Set("Content-Type", "text/html")
+
+	title := "search"
+	content := `検索ワード：<h3>{__search__}</h3><br><div style="width: 100%"><table border="1" style="width: 100%">
+	<tr style="background-color: #bde9ba;">
+	<th>番号</th>
+	<th>件名</th>
+	<th>親番号</th>
+	</tr>
+	{__tbody__}</table></div>`
+	p := ""
+	var tbody []string
+
+	r.ParseForm()
+
+	if len(r.Form["p"]) == 1 {
+		p = r.Form["p"][0]
+
+		base := `
+		<tr>
+		<td colspan="1"><a href="/parent?p={__id__}">{__id__}</a></td>
+		<td colspan="1"><a href="/parent?p={__parentid__}">{__title__}</a></td>
+		<td colspan="1"><a href="/parent?p={__parentid__}">{__parentid__}</a></td>
+		</tr>
+		`
+
+		pDbrow := searchList(p)
+		for i, data := range *pDbrow {
+			fmt.Println("row: ", i)
+			ht := strings.Replace(base, "{__id__}", html.EscapeString(strconv.Itoa(data.ID)), -1)
+			ht = strings.Replace(ht, "{__parentid__}", html.EscapeString(strconv.Itoa(data.Pid)), -1)
+			ht = strings.Replace(ht, "{__title__}", html.EscapeString(data.Title), 1)
+			tbody = append(tbody, ht)
+		}
+	}
+
+	content = strings.Replace(content, "{__tbody__}", strings.Join(tbody, "\n"), 1)
+	content = strings.Replace(content, "{__search__}", html.EscapeString(p), 1)
+
+	// output to browser
+	fmt.Fprintf(w, outputHTML(title, content, outputFormForSearch()))
 }
 
 func dumpdb(w http.ResponseWriter, r *http.Request) {
@@ -912,6 +989,7 @@ func outputHTML(t string, q string, f string) string {
 	<body>
 	<a href="/">Issue</a>&nbsp;
 	<a href="/closed">Closed</a>&nbsp;
+	<a href="/search">Search</a>&nbsp;
 	<a href="/dump">Dump</a>&nbsp;
 	<a href="/confirm_restore">Restore</a>&nbsp;
 	<hr>
@@ -995,6 +1073,20 @@ func outputFormWithChild(pid string, title string) string {
 	return ht
 }
 
+func outputFormForSearch() string {
+	base := `
+	<script>
+	</script>
+	<hr>
+	<form method="get" action="/search">
+	検索: <input type="text" id="p" name="p" required value="" placeholder="検索ワードを入力"><br>
+	<button onsubmit="">検索</button>
+	</form>
+	`
+
+	return base
+}
+
 func router(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/" {
 		selectdb(w, r)
@@ -1020,6 +1112,8 @@ func router(w http.ResponseWriter, r *http.Request) {
 		confirmRestore(w, r)
 	} else if r.URL.Path == "/restore" {
 		restoredb(w, r)
+	} else if r.URL.Path == "/search" {
+		search(w, r)
 	} else if r.URL.Path == "/init" {
 		initdb(w, r)
 	} else if r.URL.Path == "/testinit" {
@@ -1157,17 +1251,4 @@ func testInitdb(w http.ResponseWriter, r *http.Request) {
 	*/
 	http.Redirect(w, r, "/", 302)
 
-}
-
-func sayhelloName(w http.ResponseWriter, r *http.Request) {
-	r.ParseForm()       //オプションを解析します。デフォルトでは解析しません。
-	fmt.Println(r.Form) //このデータはサーバのプリント情報に出力されます。
-	fmt.Println("path", r.URL.Path)
-	fmt.Println("scheme", r.URL.Scheme)
-	fmt.Println(r.Form["url_long"])
-	for k, v := range r.Form {
-		fmt.Println("key:", k)
-		fmt.Println("val:", strings.Join(v, ""))
-	}
-	fmt.Fprintf(w, "Hello astaxie!") //ここでwに入るものがクライアントに出力されます。
 }
