@@ -1,10 +1,13 @@
 package main
 
 import (
+	"crypto/md5"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"html"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -129,9 +132,16 @@ func normalList() *[]DbrowWithLatest {
 	}
 
 	//  select t1.id,t2.id,t2.name,max(t2.created_at) from memo as t1 inner join memo as t2 on t1.id = t2.parentid GROUP BY t1.id;
+	/*
+		q := `
+			SELECT a.id, a.parentid, a.title, a.name, a.body, a.open, IFNULL(MAX(b.desired_at), a.desired_at), DATE(MAX(IFNULL(b.created_at, a.created_at))), IFNULL(b.name, a.name) FROM memo as a
+			LEFT OUTER JOIN memo as b ON a.id=b.parentid WHERE a.parentid=0 AND a.open=1 GROUP BY a.id ORDER BY a.created_at DESC
+		`
+	*/
 	q := `
-		SELECT a.id, a.parentid, a.title, a.name, a.body, a.open, IFNULL(MAX(b.desired_at), a.desired_at), DATE(MAX(IFNULL(b.created_at, a.created_at))), IFNULL(b.name, a.name) FROM memo as a
-		LEFT OUTER JOIN memo as b ON a.id=b.parentid WHERE a.parentid=0 AND a.open=1 GROUP BY a.id ORDER BY a.created_at DESC
+		SELECT a.id, a.parentid, a.title, a.name, a.body, a.open, IFNULL(MAX(b.desired_at), a.desired_at), DATE(MAX(IFNULL(b.created_at, a.created_at))), IFNULL(b.name, a.name), MAX(IFNULL(b.created_at, a.created_at)) as m FROM memo as a
+		LEFT OUTER JOIN memo as b ON a.id=b.parentid WHERE a.parentid=0 AND a.open=1 GROUP BY a.id
+		ORDER BY m DESC
 	`
 	rows, err := db.Query(q)
 
@@ -141,7 +151,7 @@ func normalList() *[]DbrowWithLatest {
 		//var name, body, desired, created string
 
 		row := DbrowWithLatest{}
-
+		var tmp string
 		// カーソルから値を取得
 		if err := rows.Scan(
 			&row.ID,
@@ -152,7 +162,8 @@ func normalList() *[]DbrowWithLatest {
 			&row.Open,
 			&row.Desired,
 			&row.Created,
-			&row.Latest); err != nil {
+			&row.Latest,
+			&tmp); err != nil {
 			log.Fatal("rows.Scan() ", err)
 			return &sliceDbrow
 		}
@@ -484,6 +495,91 @@ func restoredb(w http.ResponseWriter, r *http.Request) {
 		fmt.Printf("restore %v\n", result)
 		if err != nil {
 			log.Fatal(err)
+		}
+	}
+
+	defer db.Close()
+
+	// output to browser
+	fmt.Fprintf(w, outputHTML(title, content, "finish."))
+}
+
+func importdb(w http.ResponseWriter, r *http.Request) {
+	r.ParseForm()
+	jsonDbdata := r.Form["dbdata"][0]
+
+	title := "list"
+	content := `<div style="width: 100%"><h2>ダンプ情報</h2><textarea rows="16" cols="64">{__dumpdata__}</textarea></div>`
+
+	w.Header().Set("Content-Type", "text/html")
+
+	jdata := Dbrows{}
+
+	json.Unmarshal([]byte(jsonDbdata), &jdata.list)
+	fmt.Printf("jsonstr: %v\n", jdata.list)
+
+	db, err := sql.Open("sqlite3", "./data.db")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	sq := `
+		SELECT qaid, parentid, hash from hash qaid=? LIMIT 1
+	`
+	q := `
+		INSERT INTO memo (parentid, title, name, body, open, desired_at, created_at) VALUES(?, ?, ?, ?, ?,
+			DATE(?,'localtime'),
+			DATETIME(?,'localtime'))
+	`
+	for i, data := range jdata.list {
+		//pid, _ := strconv.Atoi(data.ID)
+		h := md5.New()
+		lineStr := data.Title + data.Name + data.Body + strconv.Itoa(data.Open) + data.Desired + data.Created
+		io.WriteString(h, lineStr)
+		md5sum := hex.EncodeToString(h.Sum(nil))
+
+		row := db.QueryRow(sq, data.ID)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		var qaid int
+		var pid int
+		var hash string
+		err = row.Scan(&qaid, &pid, &hash)
+
+		switch {
+		case err == sql.ErrNoRows:
+			// IDが存在しないので追加する（新規と推定）
+			fmt.Println("restore row: ", i)
+
+			result, err := db.Exec(q, data.Pid, data.Title, data.Name, data.Body, data.Open, data.Desired, data.Created)
+			fmt.Printf("restore %v\n", result)
+			if err != nil {
+				log.Fatal(err)
+			}
+		case err != nil:
+			log.Fatal("row.Scan() ", err)
+		default:
+			// IDが存在し、差分が存在しており、親IDが同一（IDの重複）
+			if md5sum != hash && data.Pid == pid {
+				fmt.Println("restore row: ", i)
+
+				result, err := db.Exec(q, data.Pid, data.Title, data.Name, data.Body, data.Open, data.Desired, data.Created)
+				fmt.Printf("restore %v\n", result)
+				if err != nil {
+					log.Fatal(err)
+				}
+			} else if md5sum != hash && data.Pid != pid {
+				// IDは重複するが、親IDが異なるのでまだ存在しないQA（新規と推定）
+				fmt.Println("restore row: ", i)
+
+				result, err := db.Exec(q, data.Pid, data.Title, data.Name, data.Body, data.Open, data.Desired, data.Created)
+				fmt.Printf("restore %v\n", result)
+				if err != nil {
+					log.Fatal(err)
+				}
+			}
 		}
 	}
 
@@ -1112,10 +1208,14 @@ func router(w http.ResponseWriter, r *http.Request) {
 		confirmRestore(w, r)
 	} else if r.URL.Path == "/restore" {
 		restoredb(w, r)
+	} else if r.URL.Path == "/import" {
+		importdb(w, r)
 	} else if r.URL.Path == "/search" {
 		search(w, r)
 	} else if r.URL.Path == "/init" {
 		initdb(w, r)
+	} else if r.URL.Path == "/rehash" {
+		rehashdb(w, r)
 	} else if r.URL.Path == "/testinit" {
 		testInitdb(w, r)
 	} else {
@@ -1171,6 +1271,52 @@ func initdb(w http.ResponseWriter, r *http.Request) {
         )
     `
 	execDB(db, q)
+
+	db.Close()
+
+	http.Redirect(w, r, "/", 302)
+
+}
+
+func rehashdb(w http.ResponseWriter, r *http.Request) {
+	db, err := sql.Open("sqlite3", "./data.db")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	q := `
+        DROP TABLE hash
+	`
+	iexecDB(db, q) // エラーは無視する
+
+	q = `
+        CREATE TABLE hash (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+		qaid INTEGER NOT NULL,
+		parentid INTEGER NOT NULL,
+		hash VARCHAR(4096) NOT NULL
+        )
+    `
+	execDB(db, q)
+
+	h := md5.New()
+	pDbrow := allList()
+	for i, data := range *pDbrow {
+		fmt.Println("row: ", i)
+		lineStr := data.Title + data.Name +
+			data.Body + strconv.Itoa(data.Open) +
+			data.Desired + data.Created
+		io.WriteString(h, lineStr)
+		md5sum := hex.EncodeToString(h.Sum(nil))
+		q = `
+			INSERT INTO hash (qaid, parentid, hash) values(?, ?, ?)
+		`
+		result, err := db.Exec(q, data.ID, data.Pid, md5sum)
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println("result: ", result)
+	}
 
 	db.Close()
 
